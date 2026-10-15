@@ -2,9 +2,9 @@
 
 # tollway
 
-**One endpoint between your agents and everything they call.**
+**A small, self-hosted gateway that keeps your agent running when a provider fails,
+stops it when it loops, and stops a retry from repeating an action.**
 
-Failover, circuit breakers, budgets, tool policy and tracing for LLM, MCP and A2A traffic.<br>
 Change one base URL. Keep your agent code.
 
 [![CI](https://github.com/heManKuMAR6/tollway/actions/workflows/ci.yml/badge.svg)](https://github.com/heManKuMAR6/tollway/actions/workflows/ci.yml)
@@ -15,32 +15,46 @@ Change one base URL. Keep your agent code.
 </div>
 
 > [!NOTE]
-> tollway is being built in public. **v0.1 (LLM failover) is in progress** and not released yet.
-> Everything below marked _planned_ does not exist yet. Star or watch the repo to follow along.
+> tollway is being built in public. **v0.1 (failover) is in progress and not released yet.**
+> Anything marked _planned_ does not exist yet.
 
 ---
 
-## The problem
+## Three things that break agents in production
 
-Your agent works on your laptop. In production:
+**1. The provider goes down, and the agent goes with it.**
+A 429 storm or a 503 outage, and every agent that calls that provider stops. Rate-limit errors
+are the most common LLM call failure in production. Worse, when you do have a fallback, it may
+not support tool calling or JSON mode, so it returns a 200 your agent can't use, and your logs
+call it a success.
 
-- **Your LLM provider returns 429s or goes down**, and every agent goes down with it.
-- **A runaway agent loop** burns through your API budget overnight, and nobody notices until the invoice.
-- **An agent connected to an MCP server sees every tool on it**, including `delete_repo`.
-- **Each agent has its own retry logic, keys and model names**, so switching models means redeploying all of them.
-- **Model calls, tool calls and handoffs are logged in different places**, if at all.
+**2. The agent loops, and the bill grows.**
+An agent retries a failing tool or bounces between two steps for hours. Per-key rate limits
+don't catch it, because each call looks normal. You find out from the invoice.
 
-A normal API gateway can't fix this. MCP and A2A are JSON-RPC: every request is the same `POST` to the same path, responses stream, and one user request fans out into dozens of tool calls. The gateway can't tell `read_file` from `delete_repo`, can't count tokens, and can't fail over before the first streamed token.
+**3. A retry repeats an action.**
+A tool call times out after the server has already done the work. The agent retries, and now
+there are two GitHub issues, two emails, two charges. This bug has shown up in
+[Microsoft Agent Framework](https://github.com/microsoft/agent-framework/issues/9204),
+[Langflow](https://github.com/langflow-ai/langflow/issues/15321) and
+[others](https://github.com/AgentWorkforce/relay/issues/1874).
 
-## What tollway does
+tollway sits between your agent and the services it calls and fixes each of these in one place,
+for every agent and framework.
+
+## How it works
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8080/v1", api_key="...")
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
 
 # "chat" is an alias. tollway maps it to an ordered failover chain.
-client.chat.completions.create(model="chat", messages=[...])
+client.chat.completions.create(
+    model="chat",
+    messages=[{"role": "user", "content": "hi"}],
+    extra_headers={"x-tollway-run-id": "task-42"},  # one id per agent task
+)
 ```
 
 ```yaml
@@ -51,68 +65,63 @@ aliases:
       url: https://api.openai.com/v1
       model: gpt-4.1-mini
       api_key: ${OPENAI_API_KEY}
-      first_token_timeout: 2s
-    - name: fallback
+      capabilities: [tools, json_mode]
+    - name: local
       url: http://ollama:11434/v1
-      model: llama3.2:3b
+      model: qwen2.5:7b
+      capabilities: [tools]
 ```
-
-When the primary returns 429, 5xx or misses its first-token deadline, tollway sends the request to the next backend before your agent sees an error. Every response tells you who served it:
-
-```
-x-tollway-backend: fallback
-x-tollway-attempts: 2
-x-tollway-request-id: 01J...
-```
-
-## How it works
 
 ```mermaid
 flowchart LR
-    A[Agents<br/>LangGraph · OpenAI SDK · CrewAI · Claude Code] -->|one base URL| G
+    A[Agent] -->|one base URL| I
 
-    subgraph G[tollway]
+    subgraph T[tollway]
         direction LR
-        S1[Auth] --> S2[Policy] --> S3[Guardrails] --> S4[Routing<br/>failover · breaker · retry budget] --> S5[Budgets] --> S6[Telemetry]
+        I[ingress<br/>run id] --> G[run guard<br/>budget · loops] --> P[planner<br/>skip backends that<br/>can't serve this] --> X[attempt<br/>breaker · retry budget] --> V[validate<br/>tool calls · JSON] --> E[egress<br/>headers]
+        V -. invalid → next backend .-> X
     end
 
-    G --> L[LLMs<br/>OpenAI-compatible · Ollama]
-    G --> M[MCP tool servers]
-    G --> X[Other agents · A2A]
-
-    style S4 fill:#f59e0b,color:#000
+    E --> L[LLM backends]
+    A -->|MCP tool calls| D[idempotency ledger] --> M[MCP servers]
 ```
 
-Every request runs the same fixed pipeline. **Routing ships in v0.1**; the other stages land in later milestones behind fixed hook points, so the v0.1 request path doesn't change when they arrive.
+Every response tells you what happened:
 
-## Features
+```
+x-tollway-backend: local
+x-tollway-attempts: 2
+x-tollway-failover-reason: http_429
+x-tollway-request-id: 4f9c…
+```
 
-| | Feature | Status |
+## Roadmap
+
+| Release | Fixes | What you get | Status |
+|---|---|---|---|
+| **v0.1** | Provider failures | Model aliases, ordered failover on 429/5xx/timeouts, circuit breaker, retry budget, streaming-safe failover (never splices two models), skip backends that lack tools/JSON/context, fail over when a reply has a broken tool call or JSON | in progress |
+| v0.2 | Runaway loops and cost | Per-run token, $ and step budgets; stop a run that repeats the same tool call N times | _planned_ |
+| v0.3 | Repeated actions | MCP proxy with an idempotency ledger: a retried side-effecting call returns the first result instead of running again, and an unknown outcome is never replayed | _planned_ |
+
+Each release ships with a chaos script that proves the fix and a committed benchmark.
+
+## Why not LiteLLM, Bifrost or agentgateway?
+
+They do a lot more, and if you need virtual keys, dashboards, dozens of providers or
+Kubernetes-native MCP routing, use them. tollway is for when you want something different:
+
+| | tollway | Typical gateway |
 |---|---|---|
-| 🔀 | **Model aliases.** Clients ask for `chat`, operators decide what that means | v0.1, in progress |
-| 🛟 | **Ordered failover** on 429, 5xx, connect errors and timeouts. Other 4xx pass through untouched | v0.1, in progress |
-| ⚡ | **Circuit breaker** per backend (closed → open → half-open) | v0.1, in progress |
-| 🪣 | **Retry budget.** A token bucket stops retry storms from piling onto a failing provider | v0.1, in progress |
-| 🌊 | **Streaming-safe failover.** Fails over only before the first token, so two models' output is never spliced together | v0.1, in progress |
-| 📏 | **Context-aware skip.** Backends too small for the prompt are skipped, not tried | v0.1, in progress |
-| 🔑 | Virtual keys, token and spend limits, downgrade instead of hard failure | _planned (v0.2)_ |
-| 🧰 | MCP gateway: per-key tool allowlists, argument scanning, audit log | _planned (v0.3)_ |
-| 🔭 | OpenTelemetry traces agent → gateway → model → tool, Prometheus, Grafana | _planned (v0.4)_ |
-| 🧪 | **Eval-gated failover** with [EvalForge](https://github.com/heManKuMAR6): a model joins a failover chain only after it proves its quality on shadowed live traffic | _planned (v0.5)_ |
-| 🤝 | A2A agent registry and governed handoffs | _planned (v0.6)_ |
-
-### Why not just use LiteLLM, agentgateway or Kong?
-
-They're good tools, and you might want them. tollway differs in two ways:
-
-1. **It checks quality, not just uptime.** Other gateways fail over to whatever is up. tollway pairs with EvalForge to score a candidate model against your primary on mirrored real traffic, and only lets it into a failover chain once it passes. _(planned, v0.5)_
-2. **One control plane for all three traffic types.** LLM calls, MCP tool calls and agent-to-agent handoffs get the same keys, policy, budgets and traces.
-
-A fuller, honest comparison will land with v0.1.
+| Fails over on | HTTP errors **and** unusable replies (bad tool calls, broken JSON) | Usually HTTP errors; some support custom guardrail checks |
+| Fallback selection | Skips backends that can't serve the request (tools, JSON mode, context) | Usually tries the next one in the list |
+| Loop detection | Per agent run, by repetition _(planned)_ | Per key, by rate or spend |
+| Retried tool calls | Deduplicated, unknown outcomes not replayed _(planned)_ | Passed through |
+| Footprint | One process, no database, a handful of dependencies | Often Postgres + Redis + admin UI |
 
 ## Quickstart
 
-_Coming with v0.1._ The goal: from a clean clone to a working gateway and failover demo in under 5 minutes, no paid API key needed.
+_Coming with v0.1._ Goal: from a clean clone to a working failover demo in under 5 minutes,
+with no paid API key.
 
 ```bash
 git clone https://github.com/heManKuMAR6/tollway && cd tollway
@@ -120,29 +129,16 @@ docker compose -f deploy/docker-compose.yml up   # tollway + Ollama + a mock pri
 ./chaos/kill_primary.sh                          # watch x-tollway-backend switch to Ollama
 ```
 
-## Receipts
+## Benchmarks
 
-Every milestone ships with a committed benchmark and a chaos script that proves its headline behavior. No claim in this README goes unbacked.
+Gateway overhead versus calling the backend directly, single instance, 2 vCPU. Whatever the
+numbers are, they get published in [`bench/results/`](bench/).
 
-| Target (single instance, 2 vCPU) | Goal | Measured |
+| Metric | Target | Measured |
 |---|---|---|
-| Added latency, p50 | < 5 ms | _pending v0.1_ |
-| Added latency, p95 | < 15 ms | _pending v0.1_ |
-| Throughput | ≥ 500 req/s | _pending v0.1_ |
+| Added latency p50 | < 5 ms | _pending v0.1_ |
+| Added latency p95 | < 15 ms | _pending v0.1_ |
 | Failover time | < 1 s | _pending v0.1_ |
-
-Whatever the numbers turn out to be, they get published in [`bench/results/`](bench/).
-
-## Roadmap
-
-- [ ] **v0.1: Reliability.** Aliases, failover, circuit breaker, retry budget, streaming, chaos demo, benchmark
-- [ ] **v0.2: Cost control.** Virtual keys, token and spend limits, Redis-backed shared state
-- [ ] **v0.3: Tool security.** MCP gateway, per-key tool allowlists, audit log
-- [ ] **v0.4: Observability.** OpenTelemetry, Prometheus, Grafana, admin UI
-- [ ] **v0.5: Eval-gated routing.** Shadow traffic + EvalForge readiness reports
-- [ ] **v0.6: Agent-to-agent.** A2A registry and governed handoffs
-
-Each milestone is a tagged release with a runnable demo and a write-up on the _Agents in Production_ Substack.
 
 ## Development
 
@@ -152,16 +148,14 @@ uv run ruff check && uv run ruff format --check && uv run mypy && uv run pytest
 uv run uvicorn tollway.main:create_app --factory --port 8080
 ```
 
+Design decisions live in [`docs/adr/`](docs/adr/). Contributor and agent instructions are in
+[`CLAUDE.md`](CLAUDE.md).
+
 ## Contributing
 
-Early days, so issues and design feedback are the most useful contributions right now. Have an opinion on failover semantics, or a provider quirk that breaks streaming? [Open an issue](https://github.com/heManKuMAR6/tollway/issues).
+Has one of these three problems bitten you? [Open an issue](https://github.com/heManKuMAR6/tollway/issues)
+and describe what happened. Real incidents shape what gets built.
 
 ## License
 
 [MIT](LICENSE)
-
-<div align="center">
-
-**If your agents have ever gone down because a provider did, ⭐ the repo and follow the build.**
-
-</div>
