@@ -22,26 +22,28 @@ A "run" is one agent task, identified by the `x-tollway-run-id` request header.
 multi-tenancy. If you see a seam we'll need later, write it in `docs/design-notes.md`; don't
 build it. EvalForge (or any scorer) is an optional plug-in, not core.
 
-Design principles: few dependencies, no database, stateless request path except the
-in-process run store, small enough to read in an afternoon.
+Design principles: a single static binary, few dependencies, no database, stateless request
+path except the in-process run store, small enough to read in an afternoon.
 
 ## Stack
 
-Python 3.12+ (CI on 3.12 and 3.13), uv, src layout · FastAPI + uvicorn · httpx (async) ·
-pydantic v2 + PyYAML · structlog (JSON) · pytest + pytest-asyncio (auto mode) + respx ·
-ruff (lint + format) · mypy strict on `src/` · k6 for benchmarks.
+Rust (edition 2024, stable; MSRV in `Cargo.toml`) · tokio · axum · reqwest (rustls) ·
+serde + serde_json + a maintained YAML crate · tracing (JSON) · clap · `cargo test` +
+wiremock · rustfmt · clippy (`-D warnings`) · cargo-deny · cargo-llvm-cov · k6 for
+benchmarks. See `docs/adr/0003-rust.md`.
 
-Do not add dependencies beyond these without asking.
+`unsafe` is forbidden. Do not add crates beyond these without asking; every new crate must
+pass cargo-deny.
 
 ## Layout
 
 ```
-src/tollway/
-  main.py  config.py  cli.py  errors.py
-  llm/  router.py  breaker.py  retry_budget.py  streaming.py  capabilities.py  validators.py
-  llm/providers/  base.py  openai_compat.py  mock.py
+src/
+  main.rs (thin binary)  lib.rs  app.rs  config.rs  cli.rs  error.rs
+  llm/  mod.rs  router.rs  breaker.rs  retry_budget.rs  streaming.rs  capabilities.rs  validators.rs
+  llm/providers/  mod.rs (Provider trait)  openai_compat.rs  mock.rs
   guard/   (v0.2)    tools/  (v0.3)
-tests/  unit/  integration/
+tests/   integration tests (drive the axum app in-process)
 examples/langgraph-agent/   deploy/   bench/   chaos/   docs/adr/   docs/design-notes.md
 ```
 
@@ -81,16 +83,16 @@ examples/langgraph-agent/   deploy/   bench/   chaos/   docs/adr/   docs/design-
 
 - Work in phases. Stop after each phase, show test results, and wait for "go".
 - Before every commit run the full check:
-  `uv run ruff check && uv run ruff format --check && uv run mypy && uv run pytest`
+  `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - Small conventional commits, one per logical change (`feat:`, `fix:`, `docs:`, `chore:`,
   `test:`).
-- Every rule above has a named test. Unit tests use the mock provider and respx; no real
+- Every rule above has a named test. Tests use the mock provider and wiremock; no real
   network calls.
 - Record significant decisions as ADRs in `docs/adr/`.
 
 ## Definition of done for a milestone
 
-1. CI green (coverage ≥ 85% on `src/`).
+1. CI green: fmt, clippy, tests on stable and MSRV, cargo-deny, line coverage ≥ 85%.
 2. `docker compose up` works from a clean clone.
 3. The chaos script proves the milestone's headline behavior.
 4. Benchmark results committed in `bench/results/`.
