@@ -9,7 +9,7 @@ Change one base URL. Keep your agent code.
 
 [![CI](https://github.com/heManKuMAR6/tollway/actions/workflows/ci.yml/badge.svg)](https://github.com/heManKuMAR6/tollway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Python 3.12 | 3.13](https://img.shields.io/badge/python-3.12%20%7C%203.13-blue)
+![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![Status: building v0.1](https://img.shields.io/badge/status-building%20v0.1-orange)
 
 </div>
@@ -116,7 +116,7 @@ Kubernetes-native MCP routing, use them. tollway is for when you want something 
 | Fallback selection | Skips backends that can't serve the request (tools, JSON mode, context) | Usually tries the next one in the list |
 | Loop detection | Per agent run, by repetition _(planned)_ | Per key, by rate or spend |
 | Retried tool calls | Deduplicated, unknown outcomes not replayed _(planned)_ | Passed through |
-| Footprint | One process, no database, a handful of dependencies | Often Postgres + Redis + admin UI |
+| Footprint | A single static Rust binary, no database | Often Postgres + Redis + admin UI |
 
 ## Quickstart
 
@@ -143,12 +143,12 @@ numbers are, they get published in [`bench/results/`](bench/).
 ## Development
 
 ```bash
-uv sync
-uv run ruff check && uv run ruff format --check && uv run mypy && uv run pytest
-uv run uvicorn tollway.main:create_app --factory --port 8080
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo run -- serve --port 8080      # then: curl localhost:8080/healthz
+cargo deny check                    # licenses and security advisories
 ```
 
-Design decisions live in [`docs/adr/`](docs/adr/). Contributor and agent instructions are in
+Written in Rust ([why](docs/adr/0003-rust.md)). Design decisions live in [`docs/adr/`](docs/adr/). Contributor and agent instructions are in
 [`CLAUDE.md`](CLAUDE.md).
 
 ## Contributing
